@@ -25,6 +25,7 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.Cookie;
@@ -1177,5 +1178,85 @@ public class TestRewriteValve extends TomcatBaseTest {
         res.setCharset(StandardCharsets.UTF_8);
         String body = res.toString();
         Assert.assertTrue(body, body.contains("REQUEST-URI: /other"));
+    }
+
+
+    @Test
+    public void testForbiddenWithoutRewriteSkipsNextValve() throws Exception {
+        doTestFinalReplyWithoutRewrite("RewriteRule ^/protected/.* - [F]", HttpServletResponse.SC_FORBIDDEN, null);
+    }
+
+
+    @Test
+    public void testGoneWithoutRewriteSkipsNextValve() throws Exception {
+        doTestFinalReplyWithoutRewrite("RewriteRule ^/protected/.* - [G]", HttpServletResponse.SC_GONE, null);
+    }
+
+
+    @Test
+    public void testRedirectWithoutRewriteSkipsNextValve() throws Exception {
+        doTestFinalReplyWithoutRewrite("RewriteRule ^/protected/.* - [R]", HttpServletResponse.SC_FOUND,
+                "/protected/secret");
+    }
+
+
+    @Test
+    public void testRedirectSameUrlSkipsNextValve() throws Exception {
+        doTestFinalReplyWithoutRewrite("RewriteRule ^/protected/(.*)$ /protected/$1 [R=301]",
+                HttpServletResponse.SC_MOVED_PERMANENTLY, "/protected/secret");
+    }
+
+
+    private void doTestFinalReplyWithoutRewrite(String config, int expectedStatusCode, String expectedLocation)
+            throws Exception {
+        Tomcat tomcat = getTomcatInstance();
+
+        // No file system docBase required
+        Context ctx = getProgrammaticRootContext();
+
+        RewriteValve rewriteValve = new RewriteValve();
+        ctx.getPipeline().addValve(rewriteValve);
+
+        rewriteValve.setConfiguration(config);
+
+        InvocationCountingServlet servlet = new InvocationCountingServlet();
+        Tomcat.addServlet(ctx, "protected", servlet);
+        ctx.addServletMapping("/protected/*", "protected");
+
+        tomcat.start();
+
+        ByteChunk res = new ByteChunk();
+        Map<String, List<String>> resHead = new HashMap<>();
+        int rc = methodUrl("http://localhost:" + getPort() + "/protected/secret", res, DEFAULT_CLIENT_TIMEOUT_MS,
+                null, resHead, Method.GET, false);
+
+        Assert.assertEquals(expectedStatusCode, rc);
+        if (expectedLocation != null) {
+            List<String> locations = resHead.get("Location");
+            Assert.assertNotNull(locations);
+            Assert.assertEquals(expectedLocation, locations.get(0));
+        }
+        // The final reply must end processing. The request must not reach the protected resource.
+        Assert.assertEquals(0, servlet.getInvocationCount());
+    }
+
+
+    private static class InvocationCountingServlet extends HttpServlet {
+
+        private static final long serialVersionUID = 1L;
+
+        private final AtomicInteger invocationCount = new AtomicInteger();
+
+        @Override
+        protected void doGet(HttpServletRequest req, HttpServletResponse resp) throws ServletException, IOException {
+            invocationCount.incrementAndGet();
+            resp.setContentType("text/plain");
+            resp.setCharacterEncoding("UTF-8");
+            resp.getWriter().print("PROTECTED");
+        }
+
+        public int getInvocationCount() {
+            return invocationCount.get();
+        }
     }
 }
