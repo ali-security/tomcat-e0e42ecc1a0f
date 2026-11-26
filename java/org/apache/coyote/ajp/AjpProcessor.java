@@ -178,13 +178,6 @@ public class AjpProcessor extends AbstractProcessor {
 
 
     /**
-     * Location of next write of the response message (used with non-blocking writes when the message may not be written
-     * in a single write). A value of -1 indicates that no message has been written to the buffer.
-     */
-    private int responseMsgPos = -1;
-
-
-    /**
      * Body message.
      */
     private final AjpMessage bodyMessage;
@@ -262,7 +255,7 @@ public class AjpProcessor extends AbstractProcessor {
      * Constructs a new AjpProcessor.
      *
      * @param protocol The AJP protocol
-     * @param adapter The adapter for this processor
+     * @param adapter  The adapter for this processor
      */
     public AjpProcessor(AbstractAjpProtocol<?> protocol, Adapter adapter) {
         super(adapter);
@@ -297,12 +290,16 @@ public class AjpProcessor extends AbstractProcessor {
 
     @Override
     protected boolean flushBufferedWrite() throws IOException {
-        if (hasDataToWrite()) {
+        if (socketWrapper.hasDataToWrite()) {
             socketWrapper.flush(false);
-            if (hasDataToWrite()) {
-                // There is data to write but go via Response to
-                // maintain a consistent view of non-blocking state
-                response.checkRegisterForWrite();
+            if (socketWrapper.hasDataToWrite()) {
+                /*
+                 * The socketWrapper wasn't fully flushed so re-register the socket for write. Note this does not go via
+                 * the Response since the write registration state at that level should remain unchanged. Once the
+                 * socketWrapper has been emptied then the registration below will trigger a call to
+                 * Adaptor.asyncDispatch() which will enable the Response to respond to this event.
+                 */
+                socketWrapper.registerWriteInterest();
                 return true;
             }
         }
@@ -638,6 +635,8 @@ public class AjpProcessor extends AbstractProcessor {
 
         // Request more data immediately
         if (!waitingForBodyMessage) {
+            // Make sure the non-blocking write buffer is empty before sending the get body chunk message.
+            socketWrapper.flush(true);
             socketWrapper.write(true, getBodyMessageArray, 0, getBodyMessageArray.length);
             socketWrapper.flush(true);
             waitingForBodyMessage = true;
@@ -662,7 +661,8 @@ public class AjpProcessor extends AbstractProcessor {
         if (methodCode != Constants.SC_M_JK_STORED) {
             String methodName = Constants.getMethodForCode(methodCode - 1);
             if (methodName == null) {
-                throw new IllegalArgumentException(sm.getString("ajpprocessor.request.invalidMethod", String.valueOf(methodCode)));
+                throw new IllegalArgumentException(
+                        sm.getString("ajpprocessor.request.invalidMethod", String.valueOf(methodCode)));
             }
             request.setMethod(methodName);
         }
@@ -707,7 +707,8 @@ public class AjpProcessor extends AbstractProcessor {
                 requestHeaderMessage.getInt(); // To advance the read position
                 hName = Constants.getHeaderForCode(hId - 1);
                 if (hName == null) {
-                    throw new IllegalArgumentException(sm.getString("ajpprocessor.request.invalidHeader", String.valueOf(hId)));
+                    throw new IllegalArgumentException(
+                            sm.getString("ajpprocessor.request.invalidHeader", String.valueOf(hId)));
                 }
                 vMB = headers.addValue(hName);
             } else {
@@ -826,9 +827,10 @@ public class AjpProcessor extends AbstractProcessor {
                 case Constants.SC_A_JVM_ROUTE -> requestHeaderMessage.getBytes(tmpMB);
 
                 // nothing
-                case Constants.SC_A_SSL_CERT ->
+                case Constants.SC_A_SSL_CERT -> {
                     // SSL certificate extraction is lazy, moved to JkCoyoteHandler
                     requestHeaderMessage.getBytes(certificates);
+                }
                 case Constants.SC_A_SSL_CIPHER -> {
                     requestHeaderMessage.getBytes(tmpMB);
                     request.setAttribute(SSLSupport.CIPHER_SUITE_KEY, tmpMB.toString());
@@ -837,8 +839,9 @@ public class AjpProcessor extends AbstractProcessor {
                     requestHeaderMessage.getBytes(tmpMB);
                     request.setAttribute(SSLSupport.SESSION_ID_KEY, tmpMB.toString());
                 }
-                case Constants.SC_A_SSL_KEY_SIZE ->
+                case Constants.SC_A_SSL_KEY_SIZE -> {
                     request.setAttribute(SSLSupport.KEY_SIZE_KEY, Integer.valueOf(requestHeaderMessage.getInt()));
+                }
                 case Constants.SC_A_STORED_METHOD -> {
                     requestHeaderMessage.getBytes(tmpMB);
                     ByteChunk tmpBC = tmpMB.getByteChunk();
@@ -958,7 +961,6 @@ public class AjpProcessor extends AbstractProcessor {
         }
 
         tmpMB.recycle();
-        responseMsgPos = -1;
 
         int numHeaders = headers.size();
         boolean needAjpMessageHeader = true;
@@ -1017,11 +1019,13 @@ public class AjpProcessor extends AbstractProcessor {
         // Calling code should ensure that there is no data in the buffers for
         // non-blocking writes.
         if (!responseFinished) {
+            // Make sure the non-blocking write buffer is empty before sending the flush message.
+            socketWrapper.flush(true);
             if (protocol.getAjpFlush()) {
                 // Send the flush message
                 socketWrapper.write(true, flushMessageArray, 0, flushMessageArray.length);
+                socketWrapper.flush(true);
             }
-            socketWrapper.flush(true);
         }
     }
 
@@ -1033,6 +1037,9 @@ public class AjpProcessor extends AbstractProcessor {
         }
 
         responseFinished = true;
+
+        // Make sure the non-blocking write buffer is empty before sending the end message.
+        socketWrapper.flush(true);
 
         if (getErrorState().isError()) {
             // Write the end and close message
@@ -1178,7 +1185,7 @@ public class AjpProcessor extends AbstractProcessor {
 
     @Override
     protected final boolean isReadyForWrite() {
-        return responseMsgPos == -1 && socketWrapper.isReadyForWrite();
+        return socketWrapper.isReadyForWrite();
     }
 
 
@@ -1248,11 +1255,6 @@ public class AjpProcessor extends AbstractProcessor {
         }
 
         bytesWritten += off;
-    }
-
-
-    private boolean hasDataToWrite() {
-        return responseMsgPos != -1 || socketWrapper.hasDataToWrite();
     }
 
 
